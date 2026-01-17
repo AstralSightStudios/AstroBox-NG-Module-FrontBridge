@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Listener};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tokio::sync::oneshot;
 
 pub const REQUEST_EVENT: &str = "astrobox://frontinvoke/request";
@@ -116,9 +116,15 @@ where
         payload: (!payload_value.is_null()).then_some(payload_value),
     };
 
-    app_handle
-        .emit(REQUEST_EVENT, &request)
-        .context("emit frontend invoke event")?;
+    if let Some(window) = app_handle.get_webview_window("main") {
+        window
+            .emit(REQUEST_EVENT, &request)
+            .context("emit frontend invoke event (main)")?;
+    } else {
+        app_handle
+            .emit(REQUEST_EVENT, &request)
+            .context("emit frontend invoke event")?;
+    }
 
     let resp = rx
         .await
