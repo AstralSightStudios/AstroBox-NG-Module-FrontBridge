@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager, Runtime};
 use tokio::sync::oneshot;
 
 pub const REQUEST_EVENT: &str = "astrobox://frontinvoke/request";
@@ -47,7 +47,7 @@ impl FrontInvokeState {
         }
     }
 
-    fn register_listener(self: &Arc<Self>, app_handle: &AppHandle) {
+    fn register_listener<R: Runtime>(self: &Arc<Self>, app_handle: &AppHandle<R>) {
         let state = Arc::clone(self);
         let _ = app_handle.listen_any(RESPONSE_EVENT, move |event| {
             let payload = event.payload();
@@ -86,7 +86,21 @@ impl FrontInvokeState {
 
 static FRONT_INVOKE_STATE: OnceCell<Arc<FrontInvokeState>> = OnceCell::new();
 
-fn state(app_handle: &AppHandle) -> Arc<FrontInvokeState> {
+#[cfg(feature = "test-hook")]
+type FrontInvokeTestHandler =
+    Arc<dyn Fn(&str, Option<&Value>) -> Option<Result<Value>> + Send + Sync + 'static>;
+
+#[cfg(feature = "test-hook")]
+static FRONT_INVOKE_TEST_HANDLER: OnceCell<FrontInvokeTestHandler> = OnceCell::new();
+
+#[cfg(feature = "test-hook")]
+pub fn set_test_handler(
+    handler: impl Fn(&str, Option<&Value>) -> Option<Result<Value>> + Send + Sync + 'static,
+) {
+    let _ = FRONT_INVOKE_TEST_HANDLER.set(Arc::new(handler));
+}
+
+fn state<R: Runtime>(app_handle: &AppHandle<R>) -> Arc<FrontInvokeState> {
     Arc::clone(FRONT_INVOKE_STATE.get_or_init(|| {
         let state = Arc::new(FrontInvokeState::new());
         state.register_listener(app_handle);
@@ -94,16 +108,29 @@ fn state(app_handle: &AppHandle) -> Arc<FrontInvokeState> {
     }))
 }
 
-pub async fn invoke_frontend<R, P>(
-    app_handle: &AppHandle,
+pub async fn invoke_frontend<T, P>(
+    app_handle: &AppHandle<impl Runtime>,
     method: impl Into<String>,
     payload: P,
-) -> Result<R>
+) -> Result<T>
 where
-    R: DeserializeOwned,
+    T: DeserializeOwned,
     P: Serialize,
 {
     let method = method.into();
+    #[cfg(feature = "test-hook")]
+    if let Some(handler) = FRONT_INVOKE_TEST_HANDLER.get() {
+        let payload_value = serde_json::to_value(&payload).context("serialize frontend payload")?;
+        if let Some(response) = handler(
+            &method,
+            (!payload_value.is_null()).then_some(&payload_value),
+        ) {
+            return response.and_then(|value| {
+                serde_json::from_value(value).context("deserialize frontend test response")
+            });
+        }
+    }
+
     let state = state(app_handle);
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();

@@ -3,6 +3,9 @@ name = "frontbridge"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-hook = []
+
 [dependencies]
 anyhow = "1.0"
 log = "0.4"
