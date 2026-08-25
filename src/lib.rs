@@ -4,6 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -15,11 +16,45 @@ use tokio::sync::oneshot;
 
 pub const REQUEST_EVENT: &str = "astrobox://frontinvoke/request";
 pub const RESPONSE_EVENT: &str = "astrobox://frontinvoke/response";
+const FRONTEND_READY_GENERATION_EVENT: &str = "astrobox://frontend/ready-generation";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone)]
+pub struct InvokeOptions {
+    /// Stable caller-owned id used by the frontend bridge for idempotent work.
+    pub request_id: Option<String>,
+    /// Absolute UNIX time in milliseconds. The frontend rejects expired work.
+    pub deadline_at_ms: Option<u64>,
+    /// Frontend queue-manager generation observed by the caller.
+    pub readiness_generation: Option<u64>,
+    /// Local waiter bound. This never extends `deadline_at_ms`.
+    pub timeout: Duration,
+}
+
+impl Default for InvokeOptions {
+    fn default() -> Self {
+        Self {
+            request_id: None,
+            deadline_at_ms: None,
+            readiness_generation: None,
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct FrontInvokeRequest {
     id: u64,
     method: String,
+    #[serde(rename = "requestId")]
+    request_id: String,
+    #[serde(rename = "deadlineAt")]
+    deadline_at_ms: u64,
+    #[serde(
+        rename = "readinessGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    readiness_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload: Option<Value>,
 }
@@ -32,11 +67,18 @@ struct FrontInvokeResponse {
     data: Option<Value>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default, rename = "readinessGeneration")]
+    readiness_generation: Option<u64>,
+}
+
+struct PendingRequest {
+    sender: oneshot::Sender<FrontInvokeResponse>,
+    readiness_generation: Option<u64>,
 }
 
 struct FrontInvokeState {
     next_id: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<FrontInvokeResponse>>>,
+    pending: Mutex<HashMap<u64, PendingRequest>>,
 }
 
 impl FrontInvokeState {
@@ -48,39 +90,99 @@ impl FrontInvokeState {
     }
 
     fn register_listener<R: Runtime>(self: &Arc<Self>, app_handle: &AppHandle<R>) {
-        let state = Arc::clone(self);
+        let response_state = Arc::clone(self);
         let _ = app_handle.listen_any(RESPONSE_EVENT, move |event| {
             let payload = event.payload();
             match serde_json::from_str::<FrontInvokeResponse>(payload) {
-                Ok(resp) => state.resolve(resp),
+                Ok(resp) => response_state.resolve(resp),
                 Err(err) => {
                     log::error!("[frontbridge] failed to parse response payload: {err}");
                 }
             }
         });
+
+        let generation_state = Arc::clone(self);
+        let _ = app_handle.listen_any(FRONTEND_READY_GENERATION_EVENT, move |event| {
+            let generation = serde_json::from_str::<serde_json::Value>(event.payload())
+                .ok()
+                .and_then(|payload| payload.get("generation").and_then(|value| value.as_u64()));
+            if let Some(generation) = generation {
+                generation_state.invalidate_generation(generation);
+            }
+        });
     }
 
     fn resolve(&self, resp: FrontInvokeResponse) {
-        let sender = self
+        let pending = self
             .pending
             .lock()
             .expect("frontbridge pending map poisoned")
             .remove(&resp.id);
-        if let Some(tx) = sender {
-            let _ = tx.send(resp);
+        if let Some(pending) = pending {
+            let _ = pending.sender.send(resp);
         } else {
-            log::warn!(
-                "[frontbridge] no pending request for response id={}",
+            log::debug!(
+                "[frontbridge] late response ignored for id={}",
                 resp.id
             );
         }
     }
 
-    fn add_pending(&self, id: u64, sender: oneshot::Sender<FrontInvokeResponse>) {
+    fn invalidate_generation(&self, generation: u64) {
+        let ids = {
+            let pending = self
+                .pending
+                .lock()
+                .expect("frontbridge pending map poisoned");
+            pending
+                .iter()
+                .filter_map(|(id, request)| {
+                    (request.readiness_generation.is_some_and(|expected| expected != generation))
+                        .then_some(*id)
+                })
+                .collect::<Vec<_>>()
+        };
+        for id in ids {
+            let request = self
+                .pending
+                .lock()
+                .expect("frontbridge pending map poisoned")
+                .remove(&id);
+            if let Some(request) = request {
+                let _ = request.sender.send(FrontInvokeResponse {
+                    id,
+                    success: false,
+                    data: None,
+                    error: Some("frontend readiness generation changed".to_string()),
+                    readiness_generation: Some(generation),
+                });
+            }
+        }
+    }
+
+    fn add_pending(
+        &self,
+        id: u64,
+        sender: oneshot::Sender<FrontInvokeResponse>,
+        readiness_generation: Option<u64>,
+    ) {
         self.pending
             .lock()
             .expect("frontbridge pending map poisoned")
-            .insert(id, sender);
+            .insert(
+                id,
+                PendingRequest {
+                    sender,
+                    readiness_generation,
+                },
+            );
+    }
+
+    fn remove_pending(&self, id: u64) {
+        self.pending
+            .lock()
+            .expect("frontbridge pending map poisoned")
+            .remove(&id);
     }
 }
 
@@ -108,10 +210,31 @@ fn state<R: Runtime>(app_handle: &AppHandle<R>) -> Arc<FrontInvokeState> {
     }))
 }
 
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 pub async fn invoke_frontend<T, P>(
     app_handle: &AppHandle<impl Runtime>,
     method: impl Into<String>,
     payload: P,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+    P: Serialize,
+{
+    invoke_frontend_with_options(app_handle, method, payload, InvokeOptions::default()).await
+}
+
+pub async fn invoke_frontend_with_options<T, P>(
+    app_handle: &AppHandle<impl Runtime>,
+    method: impl Into<String>,
+    payload: P,
+    options: InvokeOptions,
 ) -> Result<T>
 where
     T: DeserializeOwned,
@@ -131,31 +254,76 @@ where
         }
     }
 
+    let deadline_at_ms = options
+        .deadline_at_ms
+        .unwrap_or_else(|| unix_now_ms().saturating_add(options.timeout.as_millis() as u64));
+    let now = unix_now_ms();
+    if deadline_at_ms <= now {
+        return Err(anyhow!("frontend invoke {method} deadline expired"));
+    }
+
     let state = state(app_handle);
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    let request_id = options
+        .request_id
+        .filter(|request_id| !request_id.trim().is_empty())
+        .unwrap_or_else(|| format!("front-{id}"));
     let (tx, rx) = oneshot::channel();
-    state.add_pending(id, tx);
+    state.add_pending(id, tx, options.readiness_generation);
 
-    let payload_value = serde_json::to_value(payload).context("serialize frontend payload")?;
+    let payload_value = match serde_json::to_value(payload).context("serialize frontend payload") {
+        Ok(value) => value,
+        Err(error) => {
+            state.remove_pending(id);
+            return Err(error);
+        }
+    };
     let request = FrontInvokeRequest {
         id,
         method: method.clone(),
+        request_id,
+        deadline_at_ms,
+        readiness_generation: options.readiness_generation,
         payload: (!payload_value.is_null()).then_some(payload_value),
     };
 
-    if let Some(window) = app_handle.get_webview_window("main") {
+    let emit_result = if let Some(window) = app_handle.get_webview_window("main") {
         window
             .emit(REQUEST_EVENT, &request)
-            .context("emit frontend invoke event (main)")?;
+            .context("emit frontend invoke event (main)")
     } else {
         app_handle
             .emit(REQUEST_EVENT, &request)
-            .context("emit frontend invoke event")?;
+            .context("emit frontend invoke event")
+    };
+    if let Err(error) = emit_result {
+        state.remove_pending(id);
+        return Err(error);
     }
 
-    let resp = rx
-        .await
-        .map_err(|_| anyhow!("frontend invoke {method} dropped without response"))?;
+    let remaining = Duration::from_millis(deadline_at_ms.saturating_sub(unix_now_ms()))
+        .min(options.timeout);
+    let resp = match tokio::time::timeout(remaining, rx).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(_)) => {
+            state.remove_pending(id);
+            return Err(anyhow!("frontend invoke {method} dropped without response"));
+        }
+        Err(_) => {
+            state.remove_pending(id);
+            return Err(anyhow!("frontend invoke {method} timed out"));
+        }
+    };
+
+    if let Some(expected_generation) = options.readiness_generation {
+        if let Some(actual_generation) = resp.readiness_generation {
+            if actual_generation != expected_generation {
+                return Err(anyhow!(
+                    "frontend invoke {method} returned obsolete generation {actual_generation} (expected {expected_generation})"
+                ));
+            }
+        }
+    }
 
     if resp.success {
         let value = resp.data.unwrap_or(Value::Null);
@@ -165,5 +333,20 @@ where
             "frontend invoke {method} failed: {}",
             resp.error.unwrap_or_else(|| "unknown error".to_string())
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_options_have_a_bounded_timeout() {
+        assert_eq!(InvokeOptions::default().timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn unix_clock_is_non_zero() {
+        assert!(unix_now_ms() > 0);
     }
 }
