@@ -21,6 +21,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct InvokeOptions {
+    /// Stable client identity used to namespace frontend idempotency records.
+    pub client_id: Option<String>,
     /// Stable caller-owned id used by the frontend bridge for idempotent work.
     pub request_id: Option<String>,
     /// Absolute UNIX time in milliseconds. The frontend rejects expired work.
@@ -34,6 +36,7 @@ pub struct InvokeOptions {
 impl Default for InvokeOptions {
     fn default() -> Self {
         Self {
+            client_id: None,
             request_id: None,
             deadline_at_ms: None,
             readiness_generation: None,
@@ -46,6 +49,8 @@ impl Default for InvokeOptions {
 struct FrontInvokeRequest {
     id: u64,
     method: String,
+    #[serde(rename = "clientId", skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
     #[serde(rename = "requestId")]
     request_id: String,
     #[serde(rename = "deadlineAt")]
@@ -74,6 +79,17 @@ struct FrontInvokeResponse {
 struct PendingRequest {
     sender: oneshot::Sender<FrontInvokeResponse>,
     readiness_generation: Option<u64>,
+}
+
+struct PendingRequestGuard {
+    state: Arc<FrontInvokeState>,
+    id: u64,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        self.state.remove_pending(self.id);
+    }
 }
 
 struct FrontInvokeState {
@@ -264,6 +280,10 @@ where
 
     let state = state(app_handle);
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    let _pending_guard = PendingRequestGuard {
+        state: Arc::clone(&state),
+        id,
+    };
     let request_id = options
         .request_id
         .filter(|request_id| !request_id.trim().is_empty())
@@ -281,6 +301,7 @@ where
     let request = FrontInvokeRequest {
         id,
         method: method.clone(),
+        client_id: options.client_id,
         request_id,
         deadline_at_ms,
         readiness_generation: options.readiness_generation,
@@ -297,7 +318,6 @@ where
             .context("emit frontend invoke event")
     };
     if let Err(error) = emit_result {
-        state.remove_pending(id);
         return Err(error);
     }
 
@@ -306,11 +326,9 @@ where
     let resp = match tokio::time::timeout(remaining, rx).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
-            state.remove_pending(id);
             return Err(anyhow!("frontend invoke {method} dropped without response"));
         }
         Err(_) => {
-            state.remove_pending(id);
             return Err(anyhow!("frontend invoke {method} timed out"));
         }
     };
