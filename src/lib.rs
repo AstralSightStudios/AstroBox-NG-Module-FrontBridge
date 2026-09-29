@@ -26,11 +26,13 @@ pub struct InvokeOptions {
     /// Stable caller-owned id used by the frontend bridge for idempotent work.
     pub request_id: Option<String>,
     /// Absolute UNIX time in milliseconds. The frontend rejects expired work.
+    /// `None` means no deadline is enforced.
     pub deadline_at_ms: Option<u64>,
     /// Frontend queue-manager generation observed by the caller.
     pub readiness_generation: Option<u64>,
     /// Local waiter bound. This never extends `deadline_at_ms`.
-    pub timeout: Duration,
+    /// `None` indicates an unbounded wait (no timeout).
+    pub timeout: Option<Duration>,
 }
 
 impl Default for InvokeOptions {
@@ -40,7 +42,20 @@ impl Default for InvokeOptions {
             request_id: None,
             deadline_at_ms: None,
             readiness_generation: None,
-            timeout: DEFAULT_TIMEOUT,
+            timeout: Some(DEFAULT_TIMEOUT),
+        }
+    }
+}
+
+impl InvokeOptions {
+    /// Returns options with no timeout bound and no deadline.
+    pub fn infinite() -> Self {
+        Self {
+            client_id: None,
+            request_id: None,
+            deadline_at_ms: None,
+            readiness_generation: None,
+            timeout: None,
         }
     }
 }
@@ -53,8 +68,8 @@ struct FrontInvokeRequest {
     client_id: Option<String>,
     #[serde(rename = "requestId")]
     request_id: String,
-    #[serde(rename = "deadlineAt")]
-    deadline_at_ms: u64,
+    #[serde(rename = "deadlineAt", skip_serializing_if = "Option::is_none")]
+    deadline_at_ms: Option<u64>,
     #[serde(
         rename = "readinessGeneration",
         skip_serializing_if = "Option::is_none"
@@ -272,10 +287,12 @@ where
 
     let deadline_at_ms = options
         .deadline_at_ms
-        .unwrap_or_else(|| unix_now_ms().saturating_add(options.timeout.as_millis() as u64));
-    let now = unix_now_ms();
-    if deadline_at_ms <= now {
-        return Err(anyhow!("frontend invoke {method} deadline expired"));
+        .or_else(|| options.timeout.map(|t| unix_now_ms().saturating_add(t.as_millis() as u64)));
+    if let Some(deadline) = deadline_at_ms {
+        let now = unix_now_ms();
+        if deadline <= now {
+            return Err(anyhow!("frontend invoke {method} deadline expired"));
+        }
     }
 
     let state = state(app_handle);
@@ -321,16 +338,30 @@ where
         return Err(error);
     }
 
-    let remaining = Duration::from_millis(deadline_at_ms.saturating_sub(unix_now_ms()))
-        .min(options.timeout);
-    let resp = match tokio::time::timeout(remaining, rx).await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(_)) => {
-            return Err(anyhow!("frontend invoke {method} dropped without response"));
+    let resp = match options.timeout {
+        Some(timeout) => {
+            let remaining = match deadline_at_ms {
+                Some(deadline) => {
+                    Duration::from_millis(deadline.saturating_sub(unix_now_ms())).min(timeout)
+                }
+                None => timeout,
+            };
+            match tokio::time::timeout(remaining, rx).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(_)) => {
+                    return Err(anyhow!("frontend invoke {method} dropped without response"));
+                }
+                Err(_) => {
+                    return Err(anyhow!("frontend invoke {method} timed out"));
+                }
+            }
         }
-        Err(_) => {
-            return Err(anyhow!("frontend invoke {method} timed out"));
-        }
+        None => match rx.await {
+            Ok(resp) => resp,
+            Err(_) => {
+                return Err(anyhow!("frontend invoke {method} dropped without response"));
+            }
+        },
     };
 
     if let Some(expected_generation) = options.readiness_generation {
@@ -360,7 +391,13 @@ mod tests {
 
     #[test]
     fn default_options_have_a_bounded_timeout() {
-        assert_eq!(InvokeOptions::default().timeout, DEFAULT_TIMEOUT);
+        assert_eq!(InvokeOptions::default().timeout, Some(DEFAULT_TIMEOUT));
+    }
+
+    #[test]
+    fn infinite_options_have_no_timeout_or_deadline() {
+        assert_eq!(InvokeOptions::infinite().timeout, None);
+        assert_eq!(InvokeOptions::infinite().deadline_at_ms, None);
     }
 
     #[test]
