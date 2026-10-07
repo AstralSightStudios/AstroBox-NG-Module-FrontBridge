@@ -14,6 +14,8 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, Listener, Manager, Runtime};
 use tokio::sync::oneshot;
 
+pub mod runtime;
+
 pub const REQUEST_EVENT: &str = "astrobox://frontinvoke/request";
 pub const RESPONSE_EVENT: &str = "astrobox://frontinvoke/response";
 const FRONTEND_READY_GENERATION_EVENT: &str = "astrobox://frontend/ready-generation";
